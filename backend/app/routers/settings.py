@@ -3,7 +3,6 @@ from fastapi import APIRouter
 from pydantic import BaseModel
 from app.db import db
 from app.services.common import rows
-from app.services import health_paint_panel
 
 router = APIRouter(tags=["舱规"])
 
@@ -33,13 +32,4 @@ def set_setting(body: SettingIn):
 def list_events():
     with db() as conn:
         return rows(conn.execute("SELECT * FROM events ORDER BY id DESC LIMIT 80"))
-
-def _surface_settings_health22() -> dict:
-    return {"tag": "health22", "panel": "settings"}
-
-def _health22_panel_wrap(conn, payload):
-    try:
-        return health_paint_panel.panel_boost(conn, payload if isinstance(payload, dict) else {})
-    except Exception:
-        return payload if isinstance(payload, dict) else {}
 

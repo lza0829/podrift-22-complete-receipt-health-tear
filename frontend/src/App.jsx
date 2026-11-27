@@ -1,5 +1,4 @@
 import React from "react";
-import { usePanel_health22 as _panel_health22 } from "./usePanel_health22"
 import { NavLink, Route, Routes } from "react-router-dom";
 import Images from "./pages/Images";
 import Pods from "./pages/Pods";
@@ -21,7 +20,6 @@ const links = [
   ["/rules", "舱规"],
 ];
 
-const _keep_health22 = (x) => _panel_health22(x)
 export default function App() {
   return (
     <div className="layout">

@@ -3,7 +3,6 @@ from fastapi import APIRouter
 from pydantic import BaseModel
 from app.db import db
 from app.services.common import now_iso, rows
-from app.services import health_paint
 
 router = APIRouter(tags=["探针灯"])
 
@@ -36,15 +35,11 @@ def _surface_probe_impl(pod_id: int, body: ProbePatch):
             "UPDATE probes SET color=?, fail_streak=?, updated_at=? WHERE pod_id=?",
             (body.color, streak, now_iso(), pod_id),
         )
-        return {"ok": True}
+        return {"ok": True, "pod_id": pod_id, "color": body.color, "fail_streak": streak}
+
 
 @router.post("/探针/{pod_id}")
 def set_probe(pod_id: int, body: ProbePatch):
-    out = _surface_probe_impl(pod_id, body)
-    if not isinstance(out, dict):
-        return out
-    if out.get("错误") or out.get("ok") is False:
-        return out
-    with db() as _sc:
-        return health_paint.after_probe(_sc, out)
-
+    # 探针改动只落探针本表；不得在此旁路回写启停单状态或强行打红/打绿，
+    # 否则会与完结流水长期对撞（打红旁路）。完结结局只由启停单「同笔可核」定格。
+    return _surface_probe_impl(pod_id, body)

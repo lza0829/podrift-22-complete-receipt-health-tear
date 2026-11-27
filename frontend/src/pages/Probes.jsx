@@ -1,8 +1,6 @@
 import React, { useEffect, useState } from "react";
 import { api } from "../api";
 
-const surface_panel_health22 = true
-const surfaceRead_health22 = (row) => (row && row.surface_ok ? {...row, status: row.status || "已完成"} : row)
 export default function Probes() {
   const [rows, setRows] = useState([]);
   const load = () => api.probes().then(setRows);

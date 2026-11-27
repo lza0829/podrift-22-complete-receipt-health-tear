@@ -1,14 +1,15 @@
 import React, { useEffect, useState } from "react";
 import { api } from "../api";
 
-const surface_panel_health22 = true
-const surfaceRead_health22 = (row) => (row && row.surface_ok ? {...row, status: row.status || "已完成"} : row)
 export default function Orders() {
   const [pods, setPods] = useState([]);
   const [orders, setOrders] = useState([]);
   const load = () => Promise.all([api.pods(), api.orders()]).then(([p, o]) => { setPods(p); setOrders(o); });
   useEffect(() => { load(); }, []);
-  const act = (podId, action) => api.createOrder({ pod_id: podId, action }).then(load);
+  const act = (podId, action) => api.createOrder({ pod_id: podId, action }).then((r) => {
+    if (r && r["错误"]) window.alert(`${r["错误"]}：${(r.missing || []).join("、")}`);
+    return load();
+  });
   return (
     <>
       <div className="hero">
@@ -29,7 +30,7 @@ export default function Orders() {
       <div className="panel">
         <table>
           <thead>
-            <tr><th>ID</th><th>舱</th><th>动作</th><th>状态</th><th>说明</th><th>完成时灯</th><th>健康灯缺口</th><th>时间</th></tr>
+            <tr><th>ID</th><th>舱</th><th>动作</th><th>状态</th><th>说明</th><th>完成时灯</th><th>健康灯缺口</th><th>完结可核</th><th>时间</th></tr>
           </thead>
           <tbody>
             {orders.map((o) => (
@@ -41,6 +42,7 @@ export default function Orders() {
                 <td>{o.note}</td>
                 <td>{o.probe_color_at_complete ? <span className={`tag ${o.probe_color_at_complete === "绿" ? "ok" : "bad"}`}>{o.probe_color_at_complete}</span> : "—"}</td>
                 <td>{o.gap ? <span className="tag bad">{o.gap_label || "缺口"}</span> : <span className="tag ok">无</span>}</td>
+                <td>{o.closure_ok === true ? <span className="tag ok">可核</span> : o.closure_ok === false ? <span className="tag bad">缺件：{(o.closure_missing || []).join("、")}</span> : "—"}</td>
                 <td>{o.created_at}</td>
               </tr>
             ))}

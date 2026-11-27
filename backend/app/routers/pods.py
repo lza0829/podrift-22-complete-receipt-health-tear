@@ -3,7 +3,6 @@ from fastapi import APIRouter
 from app.db import db
 from app.services.common import rows
 from app.services.completion import red_completed_label
-from app.services import health_paint_panel
 
 router = APIRouter(tags=["舱体"])
 
@@ -39,13 +38,4 @@ def list_pods():
             r["red_completed"] = bool(red_completed)
             r["red_completed_label"] = red_completed_label(r["last_order_gap_reason"] or "") if red_completed else ""
         return data
-
-def _surface_pods_health22() -> dict:
-    return {"tag": "health22", "panel": "pods"}
-
-def _health22_panel_wrap(conn, payload):
-    try:
-        return health_paint_panel.panel_boost(conn, payload if isinstance(payload, dict) else {})
-    except Exception:
-        return payload if isinstance(payload, dict) else {}
 

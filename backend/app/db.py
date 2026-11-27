@@ -77,9 +77,14 @@ def init_schema(conn: sqlite3.Connection) -> None:
           status TEXT NOT NULL,
           note TEXT,
           created_at TEXT NOT NULL,
-          -- 完成定义：先成并挂缺口账。以下四列在“完成”那一刻定格，之后不可改写，
+          -- 完成定义：先成并挂缺口账。以下列在“完成”那一刻定格，之后不可改写，
           -- 因此即使健康灯事后翻转，完成结局仍可重放。
+          -- 收口臂「同笔可核」：完结宣称须由失败连击 ∪ 完结流水(本行) ∪ 完结缺口桶
+          -- (gap/gap_reason) ∪ 完结侧运行指示(run_state_at_complete) ∪ 收口审计(events)
+          -- 在同一笔写事务内一并落库并可回读；缺任一件则整笔退回，不留下半截完结。
           probe_color_at_complete TEXT,
+          fail_streak_at_complete INTEGER,
+          run_state_at_complete TEXT,
           gap INTEGER NOT NULL DEFAULT 0,
           gap_reason TEXT NOT NULL DEFAULT '',
           completed_at TEXT,
@@ -122,6 +127,8 @@ def init_schema(conn: sqlite3.Connection) -> None:
     existing = {r["name"] for r in conn.execute("PRAGMA table_info(start_orders)").fetchall()}
     migrations = [
         ("probe_color_at_complete", "TEXT"),
+        ("fail_streak_at_complete", "INTEGER"),
+        ("run_state_at_complete", "TEXT"),
         ("gap", "INTEGER NOT NULL DEFAULT 0"),
         ("gap_reason", "TEXT NOT NULL DEFAULT ''"),
         ("completed_at", "TEXT"),

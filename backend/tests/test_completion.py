@@ -196,3 +196,222 @@ def test_stop_order_has_no_gap():
     _, gap_ct = _align_row(2)
     # 停止不进入启动计数
     assert gap_ct["已完成启动"] == 1
+
+
+# ---------------------------------------------------------------------------
+# 收口臂「同笔可核」验收：完结宣称须由 失败连击 ∪ 完结流水 ∪ 完结缺口桶
+# ∪ 完结侧运行指示 ∪ 收口审计 同笔可核；缺一件整笔退回，不记已完结。
+# ---------------------------------------------------------------------------
+
+def _closure_of(order_id):
+    from app.db import connect
+    from app.services.completion import closure_evidence
+    conn = connect()
+    try:
+        return closure_evidence(conn, order_id)
+    finally:
+        conn.close()
+
+
+def test_completion_records_all_five_evidence_pieces():
+    res = client.post("/api/启停单", json={"pod_id": 2, "action": "启动"}).json()
+    assert res["status"] == "已完成"
+    ev = _closure_of(res["id"])
+    assert ev["ok"] is True, ev
+    assert ev["missing"] == []
+    row = ev["row"]
+    # 五件：失败连击、完结流水、完结缺口桶、完结侧运行指示、收口审计
+    assert row["fail_streak_at_complete"] == 3       # 舱2 起手连击 3
+    assert row["completed_at"]                        # 完结流水
+    assert row["gap"] == 1 and row["gap_reason"] == "红"  # 完结缺口桶
+    assert row["run_state_at_complete"] == "运行中"    # 完结侧运行指示
+    ev_audit = client.get("/api/事件").json()
+    assert any(e["kind"] == "启停单" and e["ref"] == str(res["id"]) for e in ev_audit)
+
+
+def test_red_light_completed_is_never_counted_as_clean_success():
+    """红谓词下完结仍亮：完结灯不因红被拒，但缺口桶必计，不落无缺口完成。"""
+    client.post("/api/启停单", json={"pod_id": 2, "action": "启动"})
+    data = client.get("/api/对读").json()
+    ct = data["完成缺口计数"]
+    assert ct["带缺口完成"] == 1
+    assert ct["无缺口完成"] == 0
+    assert ct["待核完结"] == 0
+    # 对读投影五件旁读为可核，且终结审计与流水对得上
+    row = next(r for r in data["舱体投影"] if r["id"] == 2)
+    assert row["closure_ok"] is True
+    assert any(a["order_id"] == str(row["last_order_id"]) for a in data["收口审计"])
+
+
+def test_missing_fail_streak_without_gap_reason_is_unverifiable():
+    """失败连击缺 而 运行指示绿：五件不齐，不得判可核。"""
+    from app.db import connect
+    from app.services.completion import closure_evidence
+    res = client.post("/api/启停单", json={"pod_id": 1, "action": "启动"}).json()
+    conn = connect()
+    try:
+        # 抹掉失败连击快照且不留“缺失”缺口原因 → 差一件
+        conn.execute(
+            "UPDATE start_orders SET fail_streak_at_complete=NULL WHERE id=?", (res["id"],)
+        )
+        conn.commit()
+        ev = closure_evidence(conn, res["id"])
+    finally:
+        conn.close()
+    assert ev["ok"] is False
+    assert "失败连击" in ev["missing"]
+    # 差额投影不得记成已完结
+    ct = client.get("/api/对读").json()["完成缺口计数"]
+    assert ct["待核完结"] == 1
+    assert ct["已完成启动"] == 0
+
+
+def test_missing_audit_makes_closure_unverifiable():
+    """审计有而完结缺口桶不加 / 审计缺档：两种单侧残件都判不可核。"""
+    from app.db import connect
+    from app.services.completion import closure_evidence
+    res = client.post("/api/启停单", json={"pod_id": 1, "action": "启动"}).json()
+    conn = connect()
+    try:
+        conn.execute("DELETE FROM events WHERE kind='启停单' AND ref=?", (str(res["id"]),))
+        conn.commit()
+        ev = closure_evidence(conn, res["id"])
+    finally:
+        conn.close()
+    assert ev["ok"] is False
+    assert "收口审计" in ev["missing"]
+    ct = client.get("/api/对读").json()["完成缺口计数"]
+    assert ct["待核完结"] == 1
+
+
+def test_half_closure_rolls_back_whole_write():
+    """半截：若收口回读缺件则整笔退回——不留流水、不留审计、不动舱体运行态。"""
+    from app.db import connect
+    from app.services import completion
+    from app.db import db_immediate
+    from app.services.common import now_iso
+
+    conn = connect()
+    before = conn.execute("SELECT COUNT(*) c FROM start_orders").fetchone()["c"]
+    conn.close()
+
+    # 直接在一个同笔事务里插一条“已完成但缺运行指示”的单，并让收口校验触发回滚。
+    try:
+        with db_immediate() as tc:
+            cur = tc.execute(
+                """INSERT INTO start_orders
+                   (pod_id, action, target_image_id, status, note, created_at,
+                    probe_color_at_complete, fail_streak_at_complete, run_state_at_complete,
+                    gap, gap_reason, completed_at)
+                   VALUES (1,'启动',1,'已完成','启动成功',?, '绿',0,NULL,0,'',?)""",
+                (now_iso(), now_iso()),
+            )
+            tc.execute(
+                "INSERT INTO events(kind, ref, detail, at) VALUES ('启停单',?,?,?)",
+                (str(cur.lastrowid), "half", now_iso()),
+            )
+            ev = completion.closure_evidence(tc, cur.lastrowid)
+            if not ev["ok"]:
+                raise completion.ClosureIncomplete(ev["missing"])
+    except completion.ClosureIncomplete as exc:
+        assert "完结侧运行指示" in exc.missing
+    else:
+        pytest.fail("缺运行指示的单应触发收口退回")
+
+    conn = connect()
+    after = conn.execute("SELECT COUNT(*) c FROM start_orders").fetchone()["c"]
+    stray_audit = conn.execute(
+        "SELECT COUNT(*) c FROM events WHERE kind='启停单' AND detail='half'"
+    ).fetchone()["c"]
+    conn.close()
+    assert after == before, "收口退回须整笔回滚，不留半截流水"
+    assert stray_audit == 0, "收口退回须连审计一并回滚"
+
+
+def test_probe_flip_after_completion_does_not_rewrite_ledger():
+    """收口写口撞上打红旁路：完结后翻红不得回写完结流水/审计，完结结局只认定格。"""
+    res = client.post("/api/启停单", json={"pod_id": 1, "action": "启动"}).json()
+    assert res["status"] == "已完成"
+    # 完结后把探针打红（原打红旁路会回写 note='完成成功' 并强改灯）
+    client.post("/api/探针/1", json={"color": "红", "fail_streak": 5})
+    order = next(o for o in client.get("/api/启停单").json() if o["id"] == res["id"])
+    assert order["status"] == "已完成"
+    assert order["note"] == "启动成功"       # 不被打红旁路改写
+    assert order["probe_color_at_complete"] == "绿"  # 定格快照不变
+    assert order["gap"] == 0
+    assert order["closure_ok"] is True
+    # 领灯为红但完结仍可核、且缺口桶不因事后翻红而回填
+    ct = client.get("/api/对读").json()["完成缺口计数"]
+    assert ct["带缺口完成"] == 0
+    assert ct["无缺口完成"] == 1
+
+
+def test_closure_and_red_bypass_interleave_no_stuck_half():
+    """连点半截 + 收口与打红交错：多笔交错后每笔要么可核、要么待核，绝无“一亮一僵”。"""
+    ids = []
+    for _ in range(3):
+        r = client.post("/api/启停单", json={"pod_id": 1, "action": "启动"}).json()
+        if r.get("id"):
+            ids.append(r["id"])
+        client.post("/api/探针/1", json={"color": "红", "fail_streak": 2})
+        client.post("/api/探针/1", json={"color": "绿", "fail_streak": 0})
+    data = client.get("/api/对读").json()
+    ct = data["完成缺口计数"]
+    assert ct["待核完结"] == 0, "正常收口路径不得产生待核残件"
+    for o in client.get("/api/启停单").json():
+        if o["action"] == "启动":
+            assert o["status"] == "已完成"
+            assert o["closure_ok"] is True
+            assert o["closure_missing"] == []
+    # 三笔全部定格为绿灯，不因交错打红回写
+    orders = [o for o in client.get("/api/启停单").json() if o["action"] == "启动"]
+    assert len(orders) == 3
+    assert all(o["probe_color_at_complete"] == "绿" for o in orders)
+
+
+def test_concurrent_orders_and_probe_flips_never_leave_dual_ledger():
+    """并发交错：启停单与探针翻转同时打，完结结局只能来自同笔定格，不出现
+    「完结灯绿而完结证据缺」的长期双账（每笔要么可核、要么显式待核）。"""
+    import threading as _t
+
+    errors = []
+
+    def order_worker():
+        try:
+            for _ in range(3):
+                client.post("/api/启停单", json={"pod_id": 1, "action": "启动"})
+        except Exception as e:  # noqa: BLE001
+            errors.append(e)
+
+    def probe_worker(color):
+        try:
+            for _ in range(10):
+                client.post("/api/探针/1", json={"color": color, "fail_streak": 4 if color == "红" else 0})
+        except Exception as e:  # noqa: BLE001
+            errors.append(e)
+
+    threads = [_t.Thread(target=order_worker), _t.Thread(target=probe_worker, args=("红",)),
+               _t.Thread(target=probe_worker, args=("绿",))]
+    for th in threads:
+        th.start()
+    for th in threads:
+        th.join()
+
+    assert not errors
+    data = client.get("/api/对读").json()
+    ct = data["完成缺口计数"]
+    starts = [o for o in client.get("/api/启停单").json() if o["action"] == "启动"]
+    # 没有已完结单被悄悄丢出可核口径：已完结数 == 可核数 + 待核数
+    assert len(starts) == ct["已完成启动"] + len(ct["待核明细"])
+    pending_ids = {o["id"] for o in ct["待核明细"]}
+    for o in starts:
+        assert o["status"] == "已完成"
+        if o["id"] in pending_ids:
+            assert o["closure_ok"] is False
+            assert o["closure_missing"]
+        else:
+            assert o["closure_ok"] is True
+            assert o["closure_missing"] == []
+            # 完结时的缺口桶与实际定格灯色一致，且与审计对读一致
+            audit = [a for a in data["收口审计"] if a["order_id"] == str(o["id"])]
+            assert len(audit) == 1
